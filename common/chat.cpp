@@ -2339,10 +2339,19 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     common_peg_parse_context ctx(effective_input, flags);
     auto result = parser.parse(ctx);
 
+    const auto is_gemma4_thought_trailer = [&]() {
+        if (params.format != COMMON_CHAT_FORMAT_PEG_GEMMA4 || result.end >= effective_input.size()) {
+            return false;
+        }
+
+        const std::string remaining = effective_input.substr(result.end);
+        return string_starts_with(remaining, "<|channel>thought") || string_starts_with(remaining, "<channel|>");
+    };
+
     if (result.fail()) {
         // During partial parsing, return partial results if any AST nodes were captured
         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
-        if (is_partial && result.end > 0) {
+        if ((is_partial && result.end > 0) || is_gemma4_thought_trailer()) {
             // Try to extract any partial results from what was successfully parsed
             common_chat_msg msg;
             msg.role = "assistant";

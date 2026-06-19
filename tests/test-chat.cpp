@@ -2498,6 +2498,12 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
 
         tst.test(
+                "<|channel>thought\nI'm\nthinking<channel|>Hello, world!\nWhat's up?<|channel>thought")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test(
                 "<|channel><|channel>thought\n<channel|>Hello, world!\nWhat's up?")
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .expect(message_assist)

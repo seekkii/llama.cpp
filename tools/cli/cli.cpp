@@ -1,12 +1,13 @@
+#include "cli.h"
 #include "chat.h"
 #include "common.h"
+#include "fit.h"
 #include "arg.h"
 #include "console.h"
-#include "fit.h"
 // #include "log.h"
 
-#include "server-common.h"
 #include "server-context.h"
+#include "server-common.h"
 #include "server-task.h"
 
 #include <array>
@@ -92,7 +93,7 @@ struct cli_context {
 
             // chat template settings
             task.params.chat_parser_params = common_chat_parser_params(chat_params);
-            task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
             if (!chat_params.parser.empty()) {
                 task.params.chat_parser_params.parser.load(chat_params.parser);
             }
@@ -203,8 +204,6 @@ struct cli_context {
         auto meta = ctx_server.get_meta();
         auto & chat_params = meta.chat_params;
 
-        auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
-
         common_chat_templates_inputs inputs;
         inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
         inputs.tools                 = {}; // TODO
@@ -212,9 +211,9 @@ struct cli_context {
         inputs.json_schema           = ""; // TODO
         inputs.grammar               = ""; // TODO
         inputs.use_jinja             = chat_params.use_jinja;
-        inputs.parallel_tool_calls   = caps["supports_parallel_tool_calls"];
+        inputs.parallel_tool_calls   = false;
         inputs.add_generation_prompt = true;
-        inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+        inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
         inputs.force_pure_content    = chat_params.force_pure_content;
         inputs.enable_thinking       = chat_params.enable_thinking ? common_chat_templates_support_enable_thinking(chat_params.tmpls.get()) : false;
 
@@ -224,11 +223,10 @@ struct cli_context {
 };
 
 // TODO?: Make this reusable, enums, docs
-static const std::array<std::string_view, 7> cmds = {
+static const std::array<const std::string, 6> cmds = {
     "/audio ",
     "/clear",
     "/exit",
-    "/glob ",
     "/image ",
     "/read ",
     "/regen",
@@ -238,19 +236,19 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
     std::vector<std::pair<std::string, size_t>> matches;
     std::string cmd;
 
-    if (line.length() > 1 && line.front() == '/' && !std::any_of(cmds.begin(), cmds.end(), [line](std::string_view prefix) {
+    if (line.length() > 1 && line[0] == '/' && !std::any_of(cmds.begin(), cmds.end(), [line](const std::string & prefix) {
         return string_starts_with(line, prefix);
     })) {
         auto it = cmds.begin();
 
-        while ((it = std::find_if(it, cmds.end(), [line](std::string_view cmd_line) {
+        while ((it = std::find_if(it, cmds.end(), [line](const std::string & cmd_line) {
             return string_starts_with(cmd_line, line);
         })) != cmds.end()) {
-            matches.emplace_back(*it, it->length());
+            matches.emplace_back(*it, (*it).length());
             ++it;
         }
     } else {
-        auto it = std::find_if(cmds.begin(), cmds.end(), [line](std::string_view prefix) {
+        auto it = std::find_if(cmds.begin(), cmds.end(), [line](const std::string & prefix) {
             return prefix.back() == ' ' && string_starts_with(line, prefix);
         });
 
@@ -259,7 +257,7 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
         }
     }
 
-    if (!cmd.empty() && cmd != "/glob " && line.length() >= cmd.length() && cursor_byte_pos >= cmd.length()) {
+    if (!cmd.empty() && line.length() >= cmd.length() && cursor_byte_pos >= cmd.length()) {
         const std::string path_prefix  = std::string(line.substr(cmd.length(), cursor_byte_pos - cmd.length()));
         const std::string path_postfix = std::string(line.substr(cursor_byte_pos));
         auto cur_dir = std::filesystem::current_path();
@@ -267,18 +265,18 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
         std::string expanded_prefix = path_prefix;
 
 #if !defined(_WIN32)
-        if (string_starts_with(path_prefix, '~')) {
+        if (string_starts_with(path_prefix, "~")) {
             const char * home = std::getenv("HOME");
             if (home && home[0]) {
-                expanded_prefix = home + path_prefix.substr(1);
+                expanded_prefix = std::string(home) + path_prefix.substr(1);
             }
         }
-        if (string_starts_with(expanded_prefix, '/')) {
+        if (string_starts_with(expanded_prefix, "/")) {
 #else
         if (std::isalpha(expanded_prefix[0]) && expanded_prefix.find(':') == 1) {
 #endif
             cur_dir = std::filesystem::path(expanded_prefix).parent_path();
-            cur_dir_str.clear();
+            cur_dir_str = "";
         } else if (!path_prefix.empty()) {
             cur_dir /= std::filesystem::path(path_prefix).parent_path();
         }
@@ -301,7 +299,7 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
             }
 
             if (expanded_prefix.empty() || string_starts_with(path_entry, expanded_prefix)) {
-                const std::string updated_line = cmd + path_entry;
+                std::string updated_line = cmd + path_entry;
                 matches.emplace_back(updated_line + path_postfix, updated_line.length());
             }
 
@@ -311,7 +309,7 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
         }
 
         if (matches.empty()) {
-            const std::string updated_line = cmd + path_prefix;
+            std::string updated_line = cmd + path_prefix;
             matches.emplace_back(updated_line + path_postfix, updated_line.length());
         }
 
@@ -328,7 +326,7 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
                 len = std::min(len, static_cast<size_t>(cmp.first - match0.begin()));
             }
 
-            const std::string updated_line = std::string(match0.substr(0, len));
+            std::string updated_line = std::string(match0.substr(0, len));
             matches.emplace_back(updated_line + path_postfix, updated_line.length());
         }
 
@@ -340,14 +338,10 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
     return matches;
 }
 
-static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
-
-int main(int argc, char ** argv) {
+static int llama_cli_run_impl(int argc, char ** argv, const std::vector<std::string> * scripted_inputs) {
     common_params params;
 
     params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs
-
-    common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
@@ -358,6 +352,8 @@ int main(int argc, char ** argv) {
         console::error("--no-conversation is not supported by llama-cli\n");
         console::error("please use llama-completion instead\n");
     }
+
+    common_init();
 
     // struct that contains llama context and inference
     cli_context ctx_cli(params);
@@ -433,8 +429,7 @@ int main(int argc, char ** argv) {
     console::log("  /exit or Ctrl+C     stop or exit\n");
     console::log("  /regen              regenerate the last response\n");
     console::log("  /clear              clear the chat history\n");
-    console::log("  /read <file>        add a text file\n");
-    console::log("  /glob <pattern>     add text files using globbing pattern\n");
+    console::log("  /read               add a text file\n");
     if (inf.has_inp_image) {
         console::log("  /image <file>       add an image file\n");
     }
@@ -443,40 +438,28 @@ int main(int argc, char ** argv) {
     }
     console::log("\n");
 
+    size_t scripted_input_index = 0;
+
     // interactive loop
     std::string cur_msg;
-
-    auto add_text_file = [&](const std::string & fname) -> bool {
-        std::string marker = ctx_cli.load_input_file(fname, false);
-        if (marker.empty()) {
-            console::error("file does not exist or cannot be opened: '%s'\n", fname.c_str());
-            return false;
-        }
-        if (inf.fim_sep_token != LLAMA_TOKEN_NULL) {
-            cur_msg += common_token_to_piece(ctx_cli.ctx_server.get_llama_context(), inf.fim_sep_token, true);
-            cur_msg += fname;
-            cur_msg.push_back('\n');
-        } else {
-            cur_msg += "--- File: ";
-            cur_msg += fname;
-            cur_msg += " ---\n";
-        }
-        cur_msg += marker;
-        console::log("Loaded text from '%s'\n", fname.c_str());
-        return true;
-    };
-
     while (true) {
         std::string buffer;
         console::set_display(DISPLAY_TYPE_USER_INPUT);
         if (params.prompt.empty()) {
-            console::log("\n> ");
-            std::string line;
-            bool another_line = true;
-            do {
-                another_line = console::readline(line, params.multiline_input);
-                buffer += line;
-            } while (another_line);
+            if (scripted_inputs && scripted_input_index < scripted_inputs->size()) {
+                buffer = (*scripted_inputs)[scripted_input_index++];
+                console::log("\n> %s\n", buffer.c_str());
+            } else if (scripted_inputs) {
+                break;
+            } else {
+                console::log("\n> ");
+                std::string line;
+                bool another_line = true;
+                do {
+                    another_line = console::readline(line, params.multiline_input);
+                    buffer += line;
+                } while (another_line);
+            }
         } else {
             // process input prompt from args
             for (auto & fname : params.image) {
@@ -550,60 +533,22 @@ int main(int argc, char ** argv) {
             continue;
         } else if (string_starts_with(buffer, "/read ")) {
             std::string fname = string_strip(buffer.substr(6));
-            add_text_file(fname);
-            continue;
-        } else if (string_starts_with(buffer, "/glob ")) {
-            std::error_code ec;
-            size_t count = 0;
-            auto curdir = std::filesystem::current_path();
-            std::string pattern = string_strip(buffer.substr(6));
-            std::filesystem::path rel_path;
-
-            auto startglob = pattern.find_first_of("![*?");
-            if (startglob != std::string::npos && startglob != 0) {
-                auto endpath = pattern.substr(0, startglob).find_last_of('/');
-                if (endpath != std::string::npos) {
-                    std::string rel_pattern = pattern.substr(0, endpath);
-#if !defined(_WIN32)
-                    if (string_starts_with(rel_pattern, '~')) {
-                        const char * home = std::getenv("HOME");
-                        if (home && home[0]) {
-                            rel_pattern = home + rel_pattern.substr(1);
-                        }
-                    }
-#endif
-                    rel_path = rel_pattern;
-                    pattern.erase(0, endpath + 1);
-                    curdir /= rel_path;
-                }
+            std::string marker = ctx_cli.load_input_file(fname, false);
+            if (marker.empty()) {
+                console::error("file does not exist or cannot be opened: '%s'\n", fname.c_str());
+                continue;
             }
-
-            for (const auto & entry : std::filesystem::recursive_directory_iterator(curdir,
-                    std::filesystem::directory_options::skip_permission_denied, ec)) {
-                if (!entry.is_regular_file()) {
-                    continue;
-                }
-
-                std::string rel = std::filesystem::relative(entry.path(), curdir, ec).string();
-                if (ec) {
-                    ec.clear();
-                    continue;
-                }
-                std::replace(rel.begin(), rel.end(), '\\', '/');
-
-                if (!glob_match(pattern, rel)) {
-                    continue;
-                }
-
-                if (!add_text_file((rel_path / rel).string())) {
-                    continue;
-                }
-
-                if (++count >= FILE_GLOB_MAX_RESULTS) {
-                    console::error("Maximum number of globbed files allowed (%zu) reached.\n", FILE_GLOB_MAX_RESULTS);
-                    break;
-                }
+            if (inf.fim_sep_token != LLAMA_TOKEN_NULL) {
+                cur_msg += common_token_to_piece(ctx_cli.ctx_server.get_llama_context(), inf.fim_sep_token, true);
+                cur_msg += fname;
+                cur_msg.push_back('\n');
+            } else {
+                cur_msg += "--- File: ";
+                cur_msg += fname;
+                cur_msg += " ---\n";
             }
+            cur_msg += marker;
+            console::log("Loaded text from '%s'\n", fname.c_str());
             continue;
         } else {
             // not a command
@@ -649,4 +594,48 @@ int main(int argc, char ** argv) {
     common_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
 
     return 0;
+}
+
+int llama_cli_run(int argc, char ** argv) {
+    return llama_cli_run_impl(argc, argv, nullptr);
+}
+
+int llama_cli_run_script(int argc, char ** argv, const std::vector<std::string> & scripted_inputs) {
+    return llama_cli_run_impl(argc, argv, &scripted_inputs);
+}
+
+int llama_cli_run_args(const std::vector<std::string> & args) {
+    std::vector<std::string> argv_storage;
+    argv_storage.reserve(args.size() + 1);
+    argv_storage.emplace_back("llama-cli");
+    argv_storage.insert(argv_storage.end(), args.begin(), args.end());
+
+    std::vector<char *> argv;
+    argv.reserve(argv_storage.size() + 1);
+    for (std::string & arg : argv_storage) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
+    return llama_cli_run(static_cast<int>(argv_storage.size()), argv.data());
+}
+
+int llama_cli_run_script_args(const std::vector<std::string> & args, const std::vector<std::string> & scripted_inputs) {
+    std::vector<std::string> argv_storage;
+    argv_storage.reserve(args.size() + 1);
+    argv_storage.emplace_back("llama-cli");
+    argv_storage.insert(argv_storage.end(), args.begin(), args.end());
+
+    std::vector<char *> argv;
+    argv.reserve(argv_storage.size() + 1);
+    for (std::string & arg : argv_storage) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
+    return llama_cli_run_script(static_cast<int>(argv_storage.size()), argv.data(), scripted_inputs);
+}
+
+int main(int argc, char ** argv) {
+    return llama_cli_run(argc, argv);
 }

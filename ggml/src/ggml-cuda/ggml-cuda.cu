@@ -61,6 +61,9 @@
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GFX906)
+#include "ggml-cuda/gfx906/matmul/mmf.cuh"
+#endif
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
@@ -1621,6 +1624,51 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GFX906)
+static bool ggml_cuda_gfx906_hipblas_perf_mode() {
+    static const bool perf_mode = [] {
+        const char * env = getenv("GGML_HIPBLAS_GFX906");
+        if (env == nullptr) {
+            return false;
+        }
+
+        if (strcmp(env, "perf") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0 || strcmp(env, "true") == 0) {
+            GGML_LOG_INFO("Detected GGML_HIPBLAS_GFX906=%s (performance mode)\n", env);
+            return true;
+        }
+
+        return false;
+    }();
+
+    return perf_mode;
+}
+
+static bool ggml_cuda_gfx906_hipblas_shape_is_safe(
+        const ggml_type src0_type,
+        const ggml_type src1_type,
+        const int64_t row_diff,
+        const int64_t src1_ncols,
+        const int64_t ne10) {
+    // Restrict perf mode to reduced-precision GEMMs only.
+    if (!((src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_BF16) &&
+          (src1_type == GGML_TYPE_F16 || src1_type == GGML_TYPE_BF16))) {
+        return false;
+    }
+
+    // Keep small or skinny GEMMs on custom kernels to avoid known hipBLAS instability.
+    if (row_diff < 128 || src1_ncols < 128 || ne10 < 128) {
+        return false;
+    }
+
+    // Restrict to aligned medium/large shapes where hipBLAS has been stable.
+    if ((row_diff % 16) != 0 || (src1_ncols % 16) != 0 || (ne10 % 16) != 0) {
+        return false;
+    }
+
+    return true;
+}
+#endif
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1645,6 +1693,41 @@ static void ggml_cuda_op_mul_mat_cublas(
     int64_t ldc = id == ctx.device ? ne0 : row_diff;
 
     const int cc = ggml_cuda_info().devices[id].cc;
+
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GFX906)
+    const bool allow_hipblas = ggml_cuda_gfx906_hipblas_perf_mode() &&
+        ggml_cuda_gfx906_hipblas_shape_is_safe(src0->type, src1->type, row_diff, src1_ncols, ne10);
+
+    if (!allow_hipblas) {
+        // Default-safe path on gfx906: bypass hipBLAS GEMM.
+        ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
+        ggml_cuda_pool_alloc<float> src1_ddq_as_f32(ctx.pool(id));
+
+        if (src0->type != GGML_TYPE_F32) {
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
+            GGML_ASSERT(to_fp32_cuda != nullptr);
+            src0_ddq_as_f32.alloc(row_diff*ne00);
+            to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, stream);
+        }
+        if (src1->type != GGML_TYPE_F32) {
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
+            GGML_ASSERT(to_fp32_cuda != nullptr);
+            src1_ddq_as_f32.alloc(src1_ncols*ne10);
+            to_fp32_cuda(src1_ddf_i, src1_ddq_as_f32.get(), src1_ncols*ne10, stream);
+        }
+
+        const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
+        const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
+
+        if (gfx906_sgemm_dispatch(src0_ddf_i, src1_ddf1_i, dst_dd_i,
+                                  row_diff, src1_ncols, ne10,
+                                  ne00, ne10, ldc, stream)) {
+            return;
+        }
+
+        GGML_ABORT("gfx906_sgemm_dispatch rejected valid GEMM shape");
+    }
+#endif
 
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
@@ -1706,8 +1789,6 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-
         const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
 
         if (!force_compute_type.fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
@@ -1715,6 +1796,17 @@ static void ggml_cuda_op_mul_mat_cublas(
                                         || cc == GGML_CUDA_CC_VOLTA
                                         || force_compute_type.fp32))
         {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GFX906)
+            if (GGML_CUDA_CC_IS_GCN(cc)) {
+                if (gfx906_mmf_dispatch(src0_ptr, src1_ptr, dst_dd_i,
+                                        (int) row_diff, (int) src1_ncols, (int) ne10,
+                                        (int) ne00, (int) ne10, (int) ldc,
+                                        stream)) {
+                    return;
+                }
+            }
+#endif
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
             const float alpha = 1.0f;
             const float beta = 0.0f;
             CUBLAS_CHECK(
@@ -1731,6 +1823,7 @@ static void ggml_cuda_op_mul_mat_cublas(
             const half alpha_f16 = 1.0f;
             const half beta_f16 = 0.0f;
 
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
             CUBLAS_CHECK(
                 cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                         row_diff, src1_ncols, ne10,
@@ -1765,6 +1858,14 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         const float alpha = 1.0f;
         const float beta = 0.0f;
+
+    #if defined(GGML_USE_HIP) && defined(GGML_HIP_GFX906)
+        if (gfx906_sgemm_dispatch(src0_ddf_i, src1_ddf1_i, dst_dd_i,
+                      row_diff, src1_ncols, ne10,
+                      ne00, ne10, ldc, stream)) {
+            return;
+        }
+    #endif
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
         CUBLAS_CHECK(
@@ -2593,6 +2694,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GFX906)
+    if (!ggml_cuda_gfx906_hipblas_perf_mode()) {
+        // Default-safe mode avoids hipBLAS batched GEMM on gfx906.
+        use_batched_cublas_f16  = false;
+        use_batched_cublas_bf16 = false;
+        use_batched_cublas_f32  = false;
+    } else {
+        // Batched hipBLAS remains disabled on gfx906: FA=0 Gemma4 still crashes here.
+        use_batched_cublas_f16  = false;
+        use_batched_cublas_bf16 = false;
+        use_batched_cublas_f32 = false;
+    }
+#endif
 
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM

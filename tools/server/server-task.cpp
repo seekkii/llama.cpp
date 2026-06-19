@@ -4,6 +4,7 @@
 #include "server-chat.h"
 #include "chat.h"
 #include "common.h"
+#include "unicode.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
 #include "sampling.h"
@@ -11,6 +12,41 @@
 #include "server-common.h"
 
 using json = nlohmann::ordered_json;
+
+namespace {
+
+std::string sanitize_utf8_for_json(const std::string & input) {
+    std::string output;
+    output.reserve(input.size());
+
+    for (size_t pos = 0; pos < input.size();) {
+        auto parsed = common_parse_utf8_codepoint(input, pos);
+        if (parsed.status == utf8_parse_result::SUCCESS) {
+            output.append(input, pos, parsed.bytes_consumed);
+            pos += parsed.bytes_consumed;
+            continue;
+        }
+
+        output += common_unicode_cpt_to_utf8(0xFFFD);
+
+        if (parsed.status == utf8_parse_result::INCOMPLETE) {
+            break;
+        }
+
+        pos += 1;
+    }
+
+    return output;
+}
+
+common_chat_msg make_raw_content_fallback(const std::string & generated_text) {
+    common_chat_msg msg;
+    msg.role = "assistant";
+    msg.content = sanitize_utf8_for_json(generated_text);
+    return msg;
+}
+
+} // namespace
 
 //
 // task_params
@@ -152,14 +188,39 @@ common_chat_msg task_result_state::update_chat_msg(
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
-    auto new_msg = common_chat_parse(
-        generated_text,
-        is_partial,
-        chat_parser_params);
+    common_chat_msg new_msg;
+    bool used_raw_content_fallback = false;
+
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            is_partial,
+            chat_parser_params);
+    } catch (const std::exception & e) {
+        SRV_WRN("chat parse failed, falling back to raw assistant content: %s\n", e.what());
+        generated_tool_call_ids.clear();
+        sent_tool_call_names.clear();
+        new_msg = make_raw_content_fallback(generated_text);
+        used_raw_content_fallback = true;
+    }
+
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
-        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+        std::vector<common_chat_msg_diff> all_diffs;
+
+        try {
+            all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+        } catch (const std::exception & e) {
+            SRV_WRN("chat diff failed%s, falling back to raw assistant content: %s\n",
+                    used_raw_content_fallback ? " after parse fallback" : "",
+                    e.what());
+            generated_tool_call_ids.clear();
+            sent_tool_call_names.clear();
+            chat_msg = make_raw_content_fallback(generated_text);
+            diffs.clear();
+            return chat_msg;
+        }
 
         if (!filter_tool_calls) {
             diffs = std::move(all_diffs);

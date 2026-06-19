@@ -2,3 +2,19 @@
 # Git's pack-file delta compression still works (byte-level), but this prevents
 # git diff from printing the entire minified file on every change.
 tools/server/public/index.html -diff
+
+# Keep local gfx906 integration files when merging or pulling upstream changes.
+# After cloning, run `scripts/setup-gfx906-merge-driver.sh` once to register the
+# local merge driver used by these paths.
+ggml/src/ggml-cuda/gfx906/** merge=keep-gfx906
+ggml/src/ggml-cuda/CMakeLists.txt merge=keep-gfx906
+ggml/src/ggml-cuda/common.cuh merge=keep-gfx906
+ggml/src/ggml-cuda/fattn-common.cuh merge=keep-gfx906
+ggml/src/ggml-cuda/fattn.cu merge=keep-gfx906
+ggml/src/ggml-cuda/ggml-cuda.cu merge=keep-gfx906
+ggml/src/ggml-hip/CMakeLists.txt merge=keep-gfx906
+SCRIPT_compile_MI50.sh merge=keep-gfx906
+SCRIPT_launch_server_MI50.sh merge=keep-gfx906
+SCRIPT_llama_bench.sh merge=keep-gfx906
+SCRIPT_llama_bench2.sh merge=keep-gfx906
+SCRIPT_overclock_upp_MI50.sh merge=keep-gfx906
