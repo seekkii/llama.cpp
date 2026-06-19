@@ -158,6 +158,19 @@ rm -rf build && mkdir -p build && cd build
 # GGML_HIP_MMQ_MFMA=ON             Use MFMA matrix instructions for MMQ (CDNA GPUs)
 # GGML_HIP_EXPORT_METRICS=OFF      Export kernel performance metrics
 # GGML_HIP_NO_HIPBLASLT=OFF        Disable hipBLASLt (enable if crashes on your ROCm)
+# GGML_HIP_GFX906=OFF              Enable gfx906-specific kernels/optimizations (Vega 20 / MI50/60)
+
+#  GFX906 KERNEL OPTIONS ===
+#
+# GFX906_MMQ_NWARPS=2              Number of warps for MMQ kernels (default 2)
+# GFX906_KVQ_MOE_CACHE_ENABLED=0   Enable key/value Q cache for MoE (0=off,1=on)
+# GFX906_Q8_CACHE_TOTAL_SIZE       Total cache size in bytes for Q8 cache (default 128*1024*1024)
+# GFX906_Q8_CACHE_NUM_SLOTS        Number of cycles/slots for Q8 cache (default 1)
+# GFX906_Q8_CACHE_LAYERS_PER_SLOT  Layers per slot for Q8 cache (default 1)
+# GFX906_ROPE_ENABLED=1            Enable ROPE optimizations on gfx906 (0/1)
+#
+# Note: GFX906_* macros are defined in ggml/src/ggml-cuda/gfx906/gfx906-config.h
+# and are active only when GGML_HIP_GFX906 is enabled.
 #
 #  NVIDIA CUDA BACKEND ===
 #
@@ -225,13 +238,12 @@ rm -rf build && mkdir -p build && cd build
 #
 # ============================================================================
 
-{
-NANOBIND_CMAKE_DIR=$("$PYTHON_EXECUTABLE" -c "import nanobind; print(nanobind.cmake_dir())")
+#{
+# NANOBIND_CMAKE_DIR=$("$PYTHON_EXECUTABLE" -c "import nanobind; print(nanobind.cmake_dir())")
 
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DPython_EXECUTABLE="$PYTHON_EXECUTABLE" \
-    -DCMAKE_PREFIX_PATH="$NANOBIND_CMAKE_DIR" \
     -DCMAKE_C_COMPILER="$ROCM_PATH"/llvm/bin/clang \
     -DCMAKE_CXX_COMPILER="$ROCM_PATH"/llvm/bin/clang++ \
     -DCMAKE_HIP_ARCHITECTURES="$AMDGPU_ARCH" \
@@ -251,7 +263,6 @@ cmake .. \
     -DGGML_CUDA_FORCE_CUBLAS=OFF \
     -DGGML_CUDA_NO_PEER_COPY=ON \
     -DLLAMA_BUILD_SERVER=ON \
-    -DLLAMA_BUILD_CLI_PYTHON=ON \
     -DLLAMA_BUILD_EXAMPLES=ON \
     -DLLAMA_BUILD_TOOLS=ON \
     -DLLAMA_BUILD_TESTS=OFF \
@@ -262,6 +273,6 @@ cmake .. \
 make -j"$(nproc)"
 
 echo ""
-echo "Build complete: ./build/bin/llama-cli, llama-server, llama-bench"
-echo "Python module: ./build/bin/llama_cpp_cli*.so"
-} 2>&1 | tee ../compilation_log.txt
+# echo "Build complete: ./build/bin/llama-cli, llama-server, llama-bench"
+# echo "Python module: ./build/bin/llama_cpp_cli*.so"
+#} 2>&1 | tee ../compilation_log.txt
